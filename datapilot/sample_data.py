@@ -14,7 +14,7 @@ def make_sample_sales(seed: int = 27, weeks: int = 52, skus: int = 8) -> pd.Data
     rows = []
     history: dict[str, list[int]] = {sku: [] for sku in sku_ids}
     for week in range(weeks):
-        date = start + pd.Timedelta(weeks=week)
+        date = start + pd.DateOffset(weeks=week)
         seasonal = 1 + 0.18 * np.sin(2 * np.pi * week / 52)
         for idx, sku in enumerate(sku_ids):
             promotion = bool(rng.random() < (0.25 if week % 4 else 0.4))
