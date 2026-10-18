@@ -1,7 +1,8 @@
 import pandas as pd
+import pytest
 
 from datapilot.profiling import infer_task, profile_dataframe
-from datapilot.sample_data import make_sample_sales
+from datapilot.sample_data import make_dirty_data_fixture, make_sample_sales
 
 
 def test_sample_data_is_deterministic_and_has_expected_columns():
@@ -30,3 +31,18 @@ def test_profile_reports_missing_duplicates_and_suspicious_target_names():
 def test_task_inference():
     assert infer_task(pd.Series(["yes", "no", "yes"])) == "classification"
     assert infer_task(pd.Series([1.4, 2.3, 3.7, 4.5, 6.2, 8.1, 10.4, 12.8, 14.2, 17.4, 20.1, 25.9, 30.2])) == "regression"
+
+
+def test_dirty_data_fixture_profiling():
+    df = make_dirty_data_fixture(seed=42, n_rows=103)
+    profile = profile_dataframe(df, target="target")
+    assert profile["missing_cells"] > 0
+    assert profile["duplicate_rows"] >= 1
+    assert "FIXED_CONSTANT" in df["constant_col"].values
+    assert "constant_col" in profile["constant_columns"]
+    assert profile["target_summary"]["missing"] > 0
+
+
+def test_empty_dataframe_profiling_raises():
+    with pytest.raises(ValueError, match="no rows"):
+        profile_dataframe(pd.DataFrame())

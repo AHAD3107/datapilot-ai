@@ -72,9 +72,7 @@ def get_tabpfn_token() -> str:
 def metric_pretty(name: str, value: float) -> str:
     if pd.isna(value):
         return "—"
-    if name in {"Accuracy", "Balanced accuracy", "F1 (weighted)"}:
-        return f"{value:.3f}"
-    return f"{value:.3f}"
+    return f"{value:.4f}" if name == "MAE" or name == "RMSE" else f"{value:.3f}"
 
 
 def render_warning(item: dict[str, str]) -> None:
@@ -128,7 +126,7 @@ with st.sidebar:
     st.caption("Audit the data before you trust the prediction.")
     st.markdown("---")
     st.markdown("**What this prototype checks**")
-    st.markdown("- Data quality and missing values\n- Potential leakage signals\n- Held-out model comparison\n- Evidence-based decision report")
+    st.markdown("- Data quality and missing values\n- Target leakage & proxy detection\n- Held-out model comparison\n- Evidence-based decision report")
     st.markdown("---")
     token_configured = bool(get_tabpfn_token())
     if token_configured:
@@ -168,7 +166,7 @@ with source_col:
 with info_col:
     st.markdown("<div class='dp-section'>Your workflow</div>", unsafe_allow_html=True)
     for num, title, detail in [
-        ("01", "Profile", "Find missing data, duplicates and suspicious columns."),
+        ("01", "Profile", "Find missing data, duplicates, and target leakage signals."),
         ("02", "Evaluate", "Use held-out data; compare TabPFN with simple baselines."),
         ("03", "Decide", "See what the metrics support—and where they do not."),
     ]:
@@ -203,23 +201,35 @@ with st.expander("Preview dataset", expanded=False):
 st.markdown("<div class='dp-section'>Configure the audit</div>", unsafe_allow_html=True)
 config_left, config_mid, config_right = st.columns([1, 1, 1.3], gap="medium")
 with config_left:
-    target = st.selectbox("Prediction target", options=list(df.columns), index=(list(df.columns).index("units_next_week") if "units_next_week" in df.columns else len(df.columns)-1))
-    profile = profile_dataframe(df, target=target)
+    target = st.selectbox(
+        "Prediction target",
+        options=list(df.columns),
+        index=(list(df.columns).index("units_next_week") if "units_next_week" in df.columns else len(df.columns)-1),
+    )
     inferred = infer_task(df[target])
     task_options = ["regression", "classification"]
     task_index = task_options.index(inferred)
     task = st.selectbox("Prediction task", task_options, index=task_index, format_func=lambda x: x.title())
+
 with config_mid:
     time_options = ["No time-based split"] + [str(c) for c in profile["date_columns"] if c != target]
     default_time = time_options.index("week_start") if "week_start" in time_options else 0
     time_choice = st.selectbox("Validation strategy", time_options, index=default_time, help="For forecasting or future outcomes, hold out the latest dates rather than randomly mixing past and future.")
     time_col = None if time_choice == "No time-based split" else time_choice
+
+# Target-aware profiling for leakage checks and suggested exclusions
+profile_target = profile_dataframe(df, target=target, time_col=time_col)
+
 with config_right:
     feature_options = [str(c) for c in df.columns if c != target]
-    suggested_exclude = [c for c in profile["constant_columns"] if c != target]
-    suggested_exclude += [c for c in profile["suspicious_columns"] if c not in suggested_exclude and c != target]
-    excluded_columns = st.multiselect("Exclude features (optional)", feature_options, default=suggested_exclude,
-                                      help="Exclude identifiers or fields unavailable at prediction time. Leakage warnings are heuristics; inspect the actual columns.")
+    suggested_exclude = [c for c in profile_target["constant_columns"] if c != target]
+    suggested_exclude += [c for c in profile_target["suspicious_columns"] if c not in suggested_exclude and c != target]
+    excluded_columns = st.multiselect(
+        "Exclude features (optional)",
+        feature_options,
+        default=suggested_exclude,
+        help="Exclude identifiers, target copies, or fields unavailable at prediction time. Leakage warnings are explainable heuristics; inspect the actual columns.",
+    )
 
 run_left, run_note = st.columns([1, 2.5], gap="medium")
 with run_left:
@@ -231,25 +241,28 @@ if run_clicked:
     try:
         with st.spinner("Profiling data, splitting rows, and evaluating models…"):
             evaluation_df = df.copy()
-            # Refresh the target-aware profiler for the selected outcome.
-            profile_target = profile_dataframe(evaluation_df, target=target)
+            # Refresh the target-aware profiler for the selected outcome
+            eval_profile = profile_dataframe(evaluation_df, target=target, time_col=time_col)
             bundle = evaluate_dataset(
-                evaluation_df, target=target, task=task, time_col=time_col,
+                evaluation_df,
+                target=target,
+                task=task,
+                time_col=time_col,
                 excluded_columns=excluded_columns,
                 run_tabpfn=True,
             )
-            # Carry profiler warnings into evaluation so a promising score cannot hide suspicious data.
+            # Carry profiler warnings into evaluation bundle
             bundle.warnings.extend(
                 f"{item['title']}: {item['detail']}"
-                for item in profile_target["warnings"]
+                for item in eval_profile["warnings"]
                 if item["level"] in {"warning", "error"}
             )
-            report = build_markdown_report(dataset_label, profile_target, bundle)
+            report = build_markdown_report(dataset_label, eval_profile, bundle)
             fingerprint = hashlib.sha256(pd.util.hash_pandas_object(evaluation_df, index=True).values.tobytes()).hexdigest()[:16]
             st.session_state["analysis_result"] = {
                 "dataset_label": dataset_label,
                 "fingerprint": fingerprint,
-                "profile": profile_target,
+                "profile": eval_profile,
                 "bundle": bundle,
                 "report": report,
                 "target": target,
@@ -278,26 +291,45 @@ st.markdown("<div class='dp-section'>Dataset health</div>", unsafe_allow_html=Tr
 health_col, warning_col = st.columns([1, 1.2], gap="large")
 with health_col:
     st.markdown("**Missingness by column**")
-    make_profile_chart(profile)
+    make_profile_chart(profile_target)
+
 with warning_col:
     st.markdown("**What the profiler noticed**")
-    if profile["warnings"]:
-        for item in profile["warnings"][:5]:
+    if profile_target["warnings"]:
+        for item in profile_target["warnings"][:5]:
             render_warning(item)
-        if len(profile["warnings"]) > 5:
-            st.caption(f"And {len(profile['warnings']) - 5} additional warning(s).")
+        if len(profile_target["warnings"]) > 5:
+            st.caption(f"And {len(profile_target['warnings']) - 5} additional warning(s).")
     else:
         st.success("No issues detected by these basic profiling checks. This is not proof that the dataset is clean.")
+
+    # Dedicated Target Leakage Findings Inspector
+    if profile_target.get("leakage_findings"):
+        st.markdown("**Target leakage audit findings**")
+        for finding in profile_target["leakage_findings"]:
+            feat = finding["feature_name"]
+            is_excl = feat in excluded_columns
+            icon = "🛑" if finding["severity"] == "critical" else ("⚠️" if finding["severity"] == "high" else "ℹ️")
+            status_text = "✅ Excluded from models" if is_excl else "🚨 ACTIVE in model inputs"
+            with st.container(border=True):
+                st.markdown(f"**{icon} `{feat}`: {finding['finding_category'].replace('_', ' ').title()}** ({status_text})")
+                st.caption(f"{finding['explanation']} Evidence: {finding['evidence']}")
+                st.caption(f"Recommended action: {finding['recommended_action']}")
+
     st.markdown("**Column profile**")
-    st.dataframe(profile["column_profile"], use_container_width=True, hide_index=True, height=240)
+    st.dataframe(profile_target["column_profile"], use_container_width=True, hide_index=True, height=240)
 
 if result:
     bundle: EvaluationBundle = result["bundle"]
-    profile_target = result["profile"]
+    eval_profile = result["profile"]
     decision = build_decision(bundle)
     st.markdown("---")
     st.markdown("<div class='dp-section'>Evaluation report</div>", unsafe_allow_html=True)
-    st.caption(f"Target: `{bundle.target}` · {bundle.task.title()} · {bundle.split_strategy} · {bundle.train_rows:,} training / {bundle.test_rows:,} held-out rows")
+    st.caption(
+        f"Target: `{bundle.target}` · {bundle.task.title()} · {bundle.split_strategy} · "
+        f"{bundle.train_rows:,} training / {bundle.test_rows:,} held-out rows · "
+        f"Excluded features: {', '.join(bundle.excluded_columns) if bundle.excluded_columns else 'None'}"
+    )
     status_col, reason_col = st.columns([1, 2.5], gap="medium")
     with status_col:
         label = decision["label"]
