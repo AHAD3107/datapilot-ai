@@ -9,8 +9,26 @@ import pandas as pd
 from .evaluation import EvaluationBundle, build_decision
 
 
+def generate_executive_summary(
+    profile: dict[str, Any],
+    bundle: EvaluationBundle,
+    dataset_name: str = "dataset.csv",
+    client: Any = None,
+) -> str:
+    """Generate a concise executive summary using the configured AI Analyst or deterministic fallback."""
+    from .analyst import get_analyst_client
+    from .context import build_audit_context
+
+    ctx = build_audit_context(profile, bundle, dataset_name=dataset_name)
+    analyst = client or get_analyst_client()
+    return analyst.generate_executive_summary(ctx)
+
+
 def build_markdown_report(
-    dataset_name: str, profile: dict[str, Any], bundle: EvaluationBundle
+    dataset_name: str,
+    profile: dict[str, Any],
+    bundle: EvaluationBundle,
+    executive_summary: str | None = None,
 ) -> str:
     decision = build_decision(bundle)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -39,6 +57,17 @@ def build_markdown_report(
         f"- **Active model features ({len(bundle.feature_columns)}):** "
         + ", ".join(f"`{c}`" for c in bundle.feature_columns),
         "",
+    ])
+
+    if executive_summary:
+        lines.extend([
+            "## Executive Brief",
+            "",
+            executive_summary,
+            "",
+        ])
+
+    lines.extend([
         "## Decision summary",
         "",
         f"**{decision['label']}** — {decision['reason']}",
@@ -67,7 +96,7 @@ def build_markdown_report(
             cat = finding["finding_category"].replace("_", " ").title()
             sev = finding["severity"].upper()
             is_excluded = feat in bundle.excluded_columns
-            status_badge = "✅ **EXCLUDED FROM MODELS**" if is_excluded else "🚨 **ACTIVE IN MODEL INPUTS**"
+            status_badge = "**EXCLUDED FROM MODELS**" if is_excluded else "**ACTIVE IN MODEL INPUTS**"
 
             lines.append(f"### Feature `{feat}` — {cat} ({sev})")
             lines.append(f"- **Status:** {status_badge}")
@@ -82,12 +111,16 @@ def build_markdown_report(
         )
         lines.append("")
 
+    corrupted_numeric = profile.get("corrupted_numeric", [])
+    cn_text = f"{len(corrupted_numeric)} column(s): {', '.join(c['column'] for c in corrupted_numeric)}" if corrupted_numeric else "None detected"
+
     lines.extend([
         "## Dataset quality",
         "",
         f"- Duplicate rows: {profile['duplicate_rows']:,}",
         f"- Missing cells: {profile['missing_cells']:,} ({profile['missing_pct']:.2f}%)",
         f"- Constant columns: {', '.join(profile['constant_columns']) or 'None detected'}",
+        f"- Corrupted numeric columns: {cn_text}",
         "",
         "## Warnings",
         "",
@@ -112,7 +145,7 @@ def build_markdown_report(
         "- This is an exploratory evaluation, not a guarantee of future performance.",
         "- A name-based leakage warning is a heuristic and cannot prove that leakage exists or does not exist.",
         "- Random hold-out results can be optimistic when data is time-dependent or grouped. Use chronological or group-aware validation where appropriate.",
-        "- Hosted TabPFN inference sends relevant dataset values to the TabPFN service. Do not upload confidential or personal data unless you have permission and have reviewed applicable policies.",
+        "- Hosted TabPFN inference sends relevant dataset values to the TabPFN service when Privacy Mode is disabled. Do not upload confidential or personal data unless you have permission and have reviewed applicable policies.",
         "- Confirm the model and API terms before commercial use.",
         "",
         "## Reproducibility",

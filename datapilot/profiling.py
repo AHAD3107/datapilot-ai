@@ -25,6 +25,75 @@ def _is_date_like(series: pd.Series, name: str) -> bool:
     return float(parsed.notna().mean()) >= 0.8
 
 
+def _detect_corrupted_numeric(series: pd.Series, col_name: str) -> dict[str, Any] | None:
+    """Detect columns that appear numeric but contain symbols, units, or non-numeric strings."""
+    if pd.api.types.is_numeric_dtype(series):
+        return None
+    if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+        return None
+
+    clean_s = series.dropna().astype(str).str.strip()
+    if len(clean_s) < 5 or clean_s.nunique() < 3:
+        return None
+
+    # If already clean numeric strings, don't flag as corrupted
+    direct_numeric = pd.to_numeric(clean_s, errors="coerce")
+    if direct_numeric.notna().mean() == 1.0:
+        return None
+
+    # Check for currency, percentage, units, separators
+    has_currency = bool(clean_s.str.contains(r"[$€£¥]", regex=True).mean() > 0.25)
+    has_pct = bool(clean_s.str.contains(r"%", regex=True).mean() > 0.25)
+    has_units = bool(
+        clean_s.str.contains(
+            r"(?i)(?:kg|g|lbs|m|km|cm|ml|l|mph|kph|hz|sec|ms)|\d+\s*(?:kg|g|lbs|m|km|cm|ml|l|mph|kph|hz|sec|ms)$",
+            regex=True,
+        ).mean()
+        > 0.25
+    )
+    has_separators = bool(
+        clean_s.str.contains(r"^\s*[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*$", regex=True).mean() > 0.25
+    )
+
+    cleaned = clean_s.str.replace(r"[^\d.\-]", "", regex=True)
+    cleaned = cleaned[cleaned != ""]
+    if cleaned.empty:
+        return None
+
+    num_parsed = pd.to_numeric(cleaned, errors="coerce")
+    clean_rate = float(num_parsed.notna().sum()) / max(len(clean_s), 1)
+
+    if clean_rate >= 0.70:
+        if has_currency:
+            pattern = "currency symbols ($/€/£)"
+        elif has_pct:
+            pattern = "percentage symbols (%)"
+        elif has_units:
+            pattern = "measurement units (e.g. kg, m)"
+        elif has_separators:
+            pattern = "number separators (e.g. commas)"
+        else:
+            pattern = "mixed non-numeric string artifacts"
+
+        corrupted_count = int((~direct_numeric.notna()).sum())
+        sample_values = [str(v)[:40] for v in clean_s.loc[~direct_numeric.notna()].head(3).tolist()]
+        if not sample_values:
+            sample_values = [str(v)[:40] for v in clean_s.head(3).tolist()]
+
+        return {
+            "column": str(col_name),
+            "clean_rate": round(clean_rate * 100, 1),
+            "corrupted_count": corrupted_count,
+            "detected_pattern": pattern,
+            "sample_values": sample_values,
+            "explanation": (
+                f"Column '{col_name}' contains values formatted with {pattern} "
+                f"({clean_rate:.1%} parseable as numeric). Currently treated as categorical text."
+            ),
+        }
+    return None
+
+
 def infer_task(target: pd.Series) -> str:
     """Suggest a task type; the user may override it in the UI."""
     y = target.dropna()
@@ -53,15 +122,30 @@ def profile_dataframe(
     identifier_like: list[str] = []
     high_cardinality: list[str] = []
     date_columns: list[str] = []
+    numeric_columns: list[str] = []
+    categorical_columns: list[str] = []
+    corrupted_numeric: list[dict[str, Any]] = []
+
     for col in df.columns:
         series = df[col]
-        name = str(col).lower()
-        if _is_date_like(series, str(col)):
-            date_columns.append(str(col))
+        col_str = str(col)
+        name = col_str.lower()
+        if _is_date_like(series, col_str) or pd.api.types.is_datetime64_any_dtype(series):
+            date_columns.append(col_str)
+        elif pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+            numeric_columns.append(col_str)
+        else:
+            categorical_columns.append(col_str)
+
         if re.search(r"(^|[_\W])(id|uuid|email|phone|customer_id|user_id)([_\W]|$)", name) and series.nunique(dropna=True) / max(rows, 1) > 0.5:
-            identifier_like.append(str(col))
-        if (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)) and series.nunique(dropna=True) > min(50, max(20, int(rows * 0.5))):
-            high_cardinality.append(str(col))
+            identifier_like.append(col_str)
+        if (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series) or isinstance(series.dtype, pd.CategoricalDtype)) and series.nunique(dropna=True) > min(50, max(20, int(rows * 0.5))):
+            high_cardinality.append(col_str)
+
+        # Check for corrupted numeric representations
+        cn = _detect_corrupted_numeric(series, col_str)
+        if cn:
+            corrupted_numeric.append(cn)
 
     warnings: list[dict[str, str]] = []
     if duplicate_rows:
@@ -97,6 +181,17 @@ def profile_dataframe(
             "title": "High-cardinality text columns",
             "detail": "Potentially expensive or unhelpful columns: " + ", ".join(high_cardinality[:8]) + ". Consider dropping, grouping, or deliberately engineering these features.",
         })
+    if corrupted_numeric:
+        for item in corrupted_numeric:
+            warnings.append({
+                "level": "warning",
+                "title": "Corrupted numeric column detected",
+                "detail": (
+                    f"Column '{item['column']}' appears numeric ({item['clean_rate']:.1f}% parseable) "
+                    f"but contains {item['detected_pattern']}. It is currently treated as categorical text. "
+                    "Clean non-numeric characters to model as continuous numeric."
+                ),
+            })
     if rows < 100:
         warnings.append({
             "level": "warning",
@@ -173,6 +268,17 @@ def profile_dataframe(
             "sample": ", ".join(df[col].dropna().astype(str).head(3).tolist())[:100],
         })
 
+    memory_bytes = int(df.memory_usage(deep=True).sum())
+    memory_mb = round(float(memory_bytes / (1024 * 1024)), 2)
+
+    suggested_exclusions: list[str] = []
+    for c in constant_columns:
+        if c != target and c not in suggested_exclusions:
+            suggested_exclusions.append(c)
+    for c in suspicious:
+        if c != target and c not in suggested_exclusions:
+            suggested_exclusions.append(c)
+
     return {
         "rows": int(rows),
         "columns": int(columns),
@@ -181,11 +287,18 @@ def profile_dataframe(
         "missing_pct": round(float(missing.sum() / max(rows * columns, 1) * 100), 2),
         "constant_columns": constant_columns,
         "date_columns": date_columns,
+        "numeric_columns": numeric_columns,
+        "categorical_columns": categorical_columns,
         "identifier_like": identifier_like,
         "high_cardinality": high_cardinality,
+        "high_cardinality_columns": high_cardinality,
+        "corrupted_numeric": corrupted_numeric,
         "suspicious_columns": suspicious,
+        "suggested_exclusions": suggested_exclusions,
         "leakage_findings": leakage_findings,
         "warnings": warnings,
         "column_profile": pd.DataFrame(column_rows),
         "target_summary": target_summary,
+        "memory_bytes": memory_bytes,
+        "memory_mb": memory_mb,
     }

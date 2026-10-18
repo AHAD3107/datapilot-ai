@@ -314,10 +314,23 @@ def evaluate_dataset(
     df: pd.DataFrame,
     target: str,
     task: str,
+    split_strategy: str = "auto",
     time_col: str | None = None,
     excluded_columns: list[str] | None = None,
     run_tabpfn: bool = True,
 ) -> EvaluationBundle:
+    """Evaluate a dataset with the specified split strategy.
+
+    Args:
+        split_strategy: One of ``'auto'``, ``'chronological'``, or ``'random'``.
+            When ``'random'``, ``time_col`` is ignored even if provided.
+            When ``'chronological'``, ``time_col`` must be supplied.
+            ``'auto'`` (default) uses ``time_col`` if present, otherwise random.
+    """
+    # Honour explicit split strategy: random forces time_col to None so the
+    # chronological code path is never triggered.
+    if split_strategy == "random":
+        time_col = None
     if target not in df.columns:
         raise ValueError("Choose a target column that exists in the dataset.")
     if task not in {"classification", "regression"}:
@@ -400,7 +413,16 @@ def evaluate_dataset(
 
     tabpfn_version_used: str | None = None
     token = os.getenv("TABPFN_TOKEN", "").strip()
-    if run_tabpfn and token:
+
+    from .policy import is_external_ai_allowed
+
+    if not is_external_ai_allowed() and run_tabpfn:
+        statuses["TabPFN"] = "disabled by privacy mode"
+        warnings.append(
+            "Hosted TabPFN inference was skipped because Privacy Mode is enabled. "
+            "Only local baseline models were evaluated. No dataset values were transmitted externally."
+        )
+    elif run_tabpfn and token:
         tabpfn_version_used = "v3.5"
         try:
             from tabpfn_client import TabPFNClassifier, TabPFNRegressor
